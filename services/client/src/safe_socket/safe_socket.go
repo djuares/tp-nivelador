@@ -9,6 +9,10 @@ import (
 func SendAll(w io.Writer, data []byte) error {
 	totalSent := 0
 	for totalSent < len(data) {
+		// Write puede devolver n=0 sin error, sin que eso signifique que
+		// la conexión se cerró (a diferencia de un Read que devuelve 0
+		// bytes junto con io.EOF); si eso pasa, simplemente hay que
+		// reintentar.
 		n, err := w.Write(data[totalSent:])
 		if err != nil {
 			return err
