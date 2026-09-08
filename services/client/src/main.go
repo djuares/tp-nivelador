@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
+	"os/signal"
+	"syscall"
 
 	client "github.com/7574-sistemas-distribuidos/tp-nivelador/src/client"
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/logger"
@@ -50,6 +53,12 @@ func loadConfig() (client.ClientConfig, error) {
 }
 
 func run() int {
+	// Cancels ctx as soon as SIGTERM is received, so the client can
+	// unblock any in-flight network call and shut down within a bounded
+	// time instead of waiting on it indefinitely.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	defer stop()
+
 	config, err := loadConfig()
 	if err != nil {
 		logger.Error("load-config", logger.Fail, "err", err)
@@ -62,7 +71,7 @@ func run() int {
 		return 1
 	}
 
-	if err := client.Run(); err != nil {
+	if err := client.Run(ctx); err != nil {
 		logger.Error("client-run", logger.Fail, "err", err)
 		return 1
 	}

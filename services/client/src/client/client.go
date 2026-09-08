@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"net"
 	"os"
@@ -63,14 +64,36 @@ func connectToServer(host, port string) (net.Conn, error) {
 	return conn, err
 }
 
+// isShutdown reports whether err is (most likely) the side effect of the
+// connection being force-closed by the shutdown watcher goroutine rather
+// than a genuine communication failure.
+func isShutdown(ctx context.Context, err error) bool {
+	return err != nil && ctx.Err() != nil
+}
+
 // Run reads the bets file (INPUT_FILE) line by line, groups them into
 // batches of size BATCH_SIZE and sends them to the server using the
 // binary protocol (BET_BATCH). Once the file is finished, it notifies
 // FINISHED, waits for the list of winning documents (WINNERS) and dumps
 // the original lines of the winning bets into OUTPUT_FILE.
-func (client *Client) Run() error {
+func (client *Client) Run(ctx context.Context) error {
 	const mainAction = "process-bets"
 	defer client.conn.Close()
+
+	// If a shutdown is requested while the client is blocked reading or
+	// writing to the connection, closing it here makes that blocked
+	// call return immediately with an error instead of waiting until a
+	// response arrives that may never come.
+	shutdownWatcherDone := make(chan struct{})
+	defer close(shutdownWatcherDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			logger.Info("shutdown", logger.InProgress, "agency-id", client.config.AgencyId)
+			client.conn.Close()
+		case <-shutdownWatcherDone:
+		}
+	}()
 
 	agencyId64, err := strconv.ParseUint(client.config.AgencyId, 10, 32)
 	if err != nil {
@@ -159,6 +182,10 @@ func (client *Client) Run() error {
 
 		if len(batch) == batchSize {
 			if err := flushBatch(batch); err != nil {
+				if isShutdown(ctx, err) {
+					logger.Info("shutdown", logger.Success, "agency-id", client.config.AgencyId)
+					return nil
+				}
 				logger.Error("send-batch", logger.Fail, "batch-id", batchesSent, "err", err)
 				return err
 			}
@@ -173,6 +200,10 @@ func (client *Client) Run() error {
 
 	// Sends the remaining bets that did not complete a full batch.
 	if err := flushBatch(batch); err != nil {
+		if isShutdown(ctx, err) {
+			logger.Info("shutdown", logger.Success, "agency-id", client.config.AgencyId)
+			return nil
+		}
 		logger.Error("send-batch", logger.Fail, "batch-id", batchesSent, "err", err)
 		return err
 	}
@@ -183,12 +214,20 @@ func (client *Client) Run() error {
 	// Notifies that there are no more bets for this agency and waits
 	// for the list of winning documents.
 	if err := protocol.SendMessage(client.conn, protocol.Finished, protocol.EncodeFinished(agencyId)); err != nil {
+		if isShutdown(ctx, err) {
+			logger.Info("shutdown", logger.Success, "agency-id", client.config.AgencyId)
+			return nil
+		}
 		logger.Error("send-finished", logger.Fail, "err", err)
 		return err
 	}
 
 	msgType, payload, err := protocol.ReadMessage(client.conn)
 	if err != nil {
+		if isShutdown(ctx, err) {
+			logger.Info("shutdown", logger.Success, "agency-id", client.config.AgencyId)
+			return nil
+		}
 		logger.Error("recv-winners", logger.Fail, "err", err)
 		return err
 	}

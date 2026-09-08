@@ -1,3 +1,4 @@
+import signal
 import socket
 import threading
 
@@ -6,6 +7,12 @@ import protocol
 from lottery import Bet, Lottery
 
 _STORAGE_PATH = "bets.csv"
+
+# How long the main thread waits for in-flight client handler threads to
+# notice the shutdown and finish cleaning up their own resources before
+# giving up on them (they are daemon threads, so the process will
+# terminate regardless once `run` returns).
+_SHUTDOWN_JOIN_TIMEOUT_SECONDS = 2
 
 
 class Server:
@@ -25,6 +32,57 @@ class Server:
         self._agency_quorum_min = agency_quorum_min
         self._quorum_cv = threading.Condition()
         self._finished_agencies: set[int] = set()
+
+        # Set by the SIGTERM handler (which always runs on the main
+        # thread) so every other thread can notice a shutdown was
+        # requested and unwind instead of blocking forever.
+        self._shutdown_requested = threading.Event()
+        self._server_socket: socket.socket | None = None
+
+        # Tracks every socket currently attached to a client handler
+        # thread, so a shutdown can force-close them and unblock any
+        # thread stuck in `recv`.
+        self._clients_lock = threading.Lock()
+        self._client_sockets: set[socket.socket] = set()
+
+    def _register_client_socket(self, client_socket) -> None:
+        with self._clients_lock:
+            self._client_sockets.add(client_socket)
+
+    def _unregister_client_socket(self, client_socket) -> None:
+        with self._clients_lock:
+            self._client_sockets.discard(client_socket)
+
+    def _handle_sigterm(self, signum, frame) -> None:
+        logger.info("shutdown", logger.LogResult.in_progress, "signal", "SIGTERM")
+        self._shutdown_requested.set()
+
+        # Unblocks the `accept()` call in the main thread: since Python
+        # automatically retries syscalls interrupted by a signal whose
+        # handler returns normally (PEP 475), we close the underlying
+        # fd here so the retried `accept()` fails immediately instead
+        # of blocking again.
+        if self._server_socket is not None:
+            try:
+                self._server_socket.close()
+            except OSError:
+                pass
+
+        # Wakes up any thread blocked waiting for the agency quorum, so
+        # it can notice the shutdown instead of hanging until every
+        # agency finishes (which may never happen).
+        with self._quorum_cv:
+            self._quorum_cv.notify_all()
+
+        # Force-closing every connected client socket unblocks any
+        # thread currently blocked on `recv`, making it raise right
+        # away instead of waiting for data that will never arrive.
+        with self._clients_lock:
+            for client_socket in self._client_sockets:
+                try:
+                    client_socket.close()
+                except OSError:
+                    pass
 
     @staticmethod
     def _to_domain_bet(dto: protocol.BetDTO) -> Bet:
@@ -51,12 +109,17 @@ class Server:
         other thread waiting here."""
         with self._quorum_cv:
             self._finished_agencies.add(agency_id)
-            if len(self._finished_agencies) >= self._agency_quorum_min:
+            quorum_met = len(self._finished_agencies) >= self._agency_quorum_min
+            if quorum_met or self._shutdown_requested.is_set():
                 self._quorum_cv.notify_all()
             else:
                 self._quorum_cv.wait_for(
                     lambda: len(self._finished_agencies) >= self._agency_quorum_min
+                    or self._shutdown_requested.is_set()
                 )
+
+        if self._shutdown_requested.is_set():
+            raise ConnectionAbortedError("server is shutting down")
 
     def _handle_finished(self, client_socket, payload: bytes) -> None:
         agency_id = protocol.decode_finished(payload)
@@ -84,6 +147,7 @@ class Server:
         action = "handle-client"
         agency_id = None
         batches_received = 0
+        self._register_client_socket(client_socket)
         try:
             logger.info(action, logger.LogResult.in_progress)
             while True:
@@ -110,24 +174,34 @@ class Server:
                 batches_received,
             )
         except Exception as e:
-            logger.error(action, logger.LogResult.fail, "agency-id", agency_id)
-            raise e
+            if self._shutdown_requested.is_set():
+                # The connection was closed on purpose as part of a
+                # graceful shutdown, not a real communication failure.
+                logger.info(action, "shutdown", "agency-id", agency_id)
+            else:
+                logger.error(action, logger.LogResult.fail, "agency-id", agency_id)
+                raise e
         finally:
+            self._unregister_client_socket(client_socket)
             client_socket.close()
 
     def run(self):
         action = "accept-connection"
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+            self._server_socket = server_socket
             server_socket.bind((self.server_host, self.server_port))
             server_socket.listen()
             threads: list[threading.Thread] = []
-            while True:
+            while not self._shutdown_requested.is_set():
                 try:
                     logger.info(action, logger.LogResult.in_progress)
                     client_socket, _ = server_socket.accept()
-                except Exception as e:
+                except OSError:
+                    if self._shutdown_requested.is_set():
+                        break
                     logger.error(action, logger.LogResult.fail)
-                    raise e
+                    raise
                 logger.info(action, logger.LogResult.success)
 
                 # Each accepted connection is handled on its own thread so
@@ -138,3 +212,13 @@ class Server:
                 )
                 client_thread.start()
                 threads.append(client_thread)
+
+        if self._shutdown_requested.is_set():
+            # Give in-flight handlers a bounded window to notice their
+            # socket was closed and unwind through their own cleanup
+            # (`finally` blocks) before the process terminates. They
+            # are daemon threads, so this is best-effort: the process
+            # will terminate on its own once `run` returns either way.
+            for client_thread in threads:
+                client_thread.join(timeout=_SHUTDOWN_JOIN_TIMEOUT_SECONDS)
+            logger.info("shutdown", logger.LogResult.success)
