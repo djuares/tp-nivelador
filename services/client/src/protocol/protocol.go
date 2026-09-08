@@ -64,30 +64,51 @@ func ReadMessage(r io.Reader) (byte, []byte, error) {
 
 // EncodeBetBatch serializes a slice of bets into a BET_BATCH payload.
 func EncodeBetBatch(bets []bet.Bet) []byte {
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, uint16(len(bets)))
+	size := 2
 
 	for _, b := range bets {
-		binary.Write(buf, binary.BigEndian, b.AgencyId)
-
-		first := []byte(b.FirstName)
-		buf.WriteByte(byte(len(first)))
-		buf.Write(first)
-
-		last := []byte(b.LastName)
-		buf.WriteByte(byte(len(last)))
-		buf.Write(last)
-
-		binary.Write(buf, binary.BigEndian, b.Document)
-
-		birthdate := make([]byte, birthdateSize)
-		copy(birthdate, b.Birthdate)
-		buf.Write(birthdate)
-
-		binary.Write(buf, binary.BigEndian, b.Number)
+		size += 4                         // agency id
+		size += 1 + len(b.FirstName)     // first name
+		size += 1 + len(b.LastName)      // last name
+		size += 4                         // document
+		size += birthdateSize             // birthdate
+		size += 4                         // number
 	}
 
-	return buf.Bytes()
+	payload := make([]byte, size)
+
+	offset := 0
+
+	binary.BigEndian.PutUint16(payload[offset:], uint16(len(bets)))
+	offset += 2
+
+	for _, b := range bets {
+		binary.BigEndian.PutUint32(payload[offset:], b.AgencyId)
+		offset += 4
+
+		first := []byte(b.FirstName)
+		payload[offset] = byte(len(first))
+		offset++
+		copy(payload[offset:], first)
+		offset += len(first)
+
+		last := []byte(b.LastName)
+		payload[offset] = byte(len(last))
+		offset++
+		copy(payload[offset:], last)
+		offset += len(last)
+
+		binary.BigEndian.PutUint32(payload[offset:], b.Document)
+		offset += 4
+
+		copy(payload[offset:offset+birthdateSize], b.Birthdate)
+		offset += birthdateSize
+
+		binary.BigEndian.PutUint32(payload[offset:], b.Number)
+		offset += 4
+	}
+
+	return payload
 }
 
 // EncodeFinished serializes a FINISHED payload (just the agency id).
@@ -106,21 +127,25 @@ func DecodeAck(payload []byte) (bool, error) {
 }
 
 // DecodeWinners parses a WINNERS payload into a set of winning documents.
-func DecodeWinners(payload []byte) (map[uint32]bool, error) {
+func DecodeWinners(payload []byte) ([]uint32, error) {
 	if len(payload) < 2 {
 		return nil, errors.New("invalid winners payload")
 	}
+
 	count := binary.BigEndian.Uint16(payload[:2])
 	offset := 2
 
-	winners := make(map[uint32]bool, count)
+	if offset+int(count)*4 > len(payload) {
+		return nil, errors.New("invalid winners payload")
+	}
+
+	winners := make([]uint32, count)
+
 	for i := 0; i < int(count); i++ {
-		if offset+4 > len(payload) {
-			return nil, errors.New("invalid winners payload")
-		}
-		document := binary.BigEndian.Uint32(payload[offset : offset+4])
-		winners[document] = true
+		winners[i] = binary.BigEndian.Uint32(payload[offset:])
 		offset += 4
 	}
+
 	return winners, nil
 }
+

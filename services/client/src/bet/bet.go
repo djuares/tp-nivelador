@@ -18,27 +18,46 @@ type Bet struct {
 // ParseBet converts one raw CSV line ("first,last,document,birthdate,number")
 // plus the agency id into a domain Bet.
 func ParseBet(line string, agencyId uint32) (Bet, error) {
-	fields := strings.Split(line, ",")
-	if len(fields) != 5 {
-		return Bet{}, fmt.Errorf("invalid bet line, expected 5 fields, got %d", len(fields))
+	firstName, rest, ok := strings.Cut(line, ",")
+	if !ok {
+		return Bet{}, fmt.Errorf("invalid bet line, expected 5 fields")
 	}
 
-	document, err := strconv.ParseUint(strings.TrimSpace(fields[2]), 10, 32)
+	lastName, rest, ok := strings.Cut(rest, ",")
+	if !ok {
+		return Bet{}, fmt.Errorf("invalid bet line, expected 5 fields")
+	}
+
+	documentStr, rest, ok := strings.Cut(rest, ",")
+	if !ok {
+		return Bet{}, fmt.Errorf("invalid bet line, expected 5 fields")
+	}
+
+	birthdate, numberStr, ok := strings.Cut(rest, ",")
+	if !ok {
+		return Bet{}, fmt.Errorf("invalid bet line, expected 5 fields")
+	}
+
+	documentStr = strings.TrimSpace(documentStr)
+	numberStr = strings.TrimSpace(numberStr)
+	birthdate = strings.TrimSpace(birthdate)
+
+	document, err := strconv.ParseUint(documentStr, 10, 32)
 	if err != nil {
 		return Bet{}, fmt.Errorf("invalid document: %w", err)
 	}
 
-	number, err := strconv.ParseUint(strings.TrimSpace(fields[4]), 10, 32)
+	number, err := strconv.ParseUint(numberStr, 10, 32)
 	if err != nil {
 		return Bet{}, fmt.Errorf("invalid number: %w", err)
 	}
 
 	return Bet{
 		AgencyId:  agencyId,
-		FirstName: fields[0],
-		LastName:  fields[1],
+		FirstName: firstName,
+		LastName:  lastName,
 		Document:  uint32(document),
-		Birthdate: strings.TrimSpace(fields[3]),
+		Birthdate: birthdate,
 		Number:    uint32(number),
 	}, nil
 }
