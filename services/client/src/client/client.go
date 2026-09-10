@@ -159,10 +159,12 @@ func documentFromCSVLine(line []byte) (uint32, error) {
 
 func (client *Client) Run(ctx context.Context) error {
 	// Keep the client's heap bounded while processing large input files.
-	// The memory-profile test measures the container's peak RSS, so using
-	// a more frequent GC prevents temporary parsing allocations from
-	// causing the process to retain a much larger heap.
-	oldGCPercent := debug.SetGCPercent(50)
+	// The memory-profile test measures the container's peak RSS, so we
+	// combine a lower GOGC with periodic forced scavenging: SetGCPercent
+	// alone only limits the *logical* heap size, it doesn't force freed
+	// pages back to the OS. debug.FreeOSMemory() does — the background
+	// scavenger is too slow to act within this process's short lifetime.
+	oldGCPercent := debug.SetGCPercent(30)
 	defer debug.SetGCPercent(oldGCPercent)
 
 	const mainAction = "process-bets"
@@ -229,6 +231,8 @@ func (client *Client) Run(ctx context.Context) error {
 	// and is reused for all subsequent batches.
 	payloadBuffer := make([]byte, 0, batchSize*64)
 
+	batchesFlushed := 0
+
 	flushBatch := func(batch []bet.Bet) error {
 		if len(batch) == 0 {
 			return nil
@@ -260,6 +264,15 @@ func (client *Client) Run(ctx context.Context) error {
 
 		if !ok {
 			return errors.New("server rejected bet batch")
+		}
+
+		batchesFlushed++
+
+		// Force freed batch/parsing memory back to the OS periodically.
+		// FreeOSMemory does a full STW GC + sync scavenge, so we don't
+		// call it on every batch to avoid hurting throughput.
+		if batchesFlushed%20 == 0 {
+			debug.FreeOSMemory()
 		}
 
 		return nil
@@ -351,6 +364,10 @@ func (client *Client) Run(ctx context.Context) error {
 	// We no longer need the batch. Clearing the slice removes references
 	// to the strings belonging to the last input lines.
 	batch = nil
+
+	// One last squeeze before we're done sending: this is typically where
+	// the peak has accumulated.
+	debug.FreeOSMemory()
 
 	// Tell the server there are no more bets.
 	if err := protocol.SendMessage(
